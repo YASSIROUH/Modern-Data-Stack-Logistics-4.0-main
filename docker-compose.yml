@@ -1,0 +1,281 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: 01_zookeeper
+    mem_limit: 256m
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: ruok
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+    - logistics_net
+    restart: always
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: 02_kafka
+    mem_limit: 1024m
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+    - 9092:9092
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+    - logistics_net
+    restart: always
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: 03_spark_master
+    mem_limit: 512m
+    environment:
+    - SPARK_MODE=master
+    - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    - SPARK_RPC_ENCRYPTION_ENABLED=no
+    - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+    - SPARK_SSL_ENABLED=no
+    ports:
+    - 8082:8080
+    - 7077:7077
+    volumes:
+    - ./spark_processor.py:/opt/bitnami/spark/jobs/spark_processor.py
+    - ./train_model.py:/opt/bitnami/spark/jobs/train_model.py
+    - ./spark_jars:/opt/bitnami/spark/jars_custom
+    - ./spark_models:/opt/logistics/spark_models
+    - ../DataCoSupplyChainDataset.csv:/tmp/DataCoSupplyChainDataset.csv:ro
+    networks:
+    - logistics_net
+    restart: always
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: 04_spark_worker
+    mem_limit: 1g
+    depends_on:
+    - spark-master
+    environment:
+    - SPARK_MODE=worker
+    - SPARK_MASTER_URL=spark://spark-master:7077
+    - SPARK_WORKER_MEMORY=1G
+    - SPARK_WORKER_CORES=1
+    volumes:
+    - ./spark_processor.py:/opt/bitnami/spark/jobs/spark_processor.py
+    - ./train_model.py:/opt/bitnami/spark/jobs/train_model.py
+    - ./spark_jars:/opt/bitnami/spark/jars_custom
+    - ./spark_models:/opt/logistics/spark_models
+    - ../DataCoSupplyChainDataset.csv:/tmp/DataCoSupplyChainDataset.csv:ro
+    networks:
+    - logistics_net
+    restart: always
+  postgres:
+    image: postgres:15-alpine
+    container_name: 05_postgres
+    mem_limit: 512m
+    ports:
+    - 5432:5432
+    environment:
+    - POSTGRES_USER=admin_logistics
+    - POSTGRES_PASSWORD=securepassword123
+    - POSTGRES_DB=logistics_db
+    volumes:
+    - ./postgres-init:/docker-entrypoint-initdb.d
+    - pgdata_logistics:/var/lib/postgresql/data
+    networks:
+    - logistics_net
+    restart: always
+  adminer:
+    image: adminer
+    container_name: 06_adminer
+    mem_limit: 128m
+    ports:
+    - 8081:8080
+    environment:
+    - ADMINER_DEFAULT_SERVER=postgres
+    networks:
+    - logistics_net
+    restart: always
+  minio:
+    image: minio/minio:latest
+    container_name: 07_minio
+    mem_limit: 512m
+    environment:
+    - MINIO_ROOT_USER=admin
+    - MINIO_ROOT_PASSWORD=password
+    ports:
+    - 9000:9000
+    - 9001:9001
+    volumes:
+    - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+    - logistics_net
+    restart: always
+  minio-init:
+    image: minio/mc:latest
+    container_name: 08_minio_init
+    mem_limit: 128m
+    depends_on:
+    - minio
+    entrypoint: '/bin/sh -c " echo ''Init MinIO...''; sleep 5; /usr/bin/mc config
+      host add myminio http://minio:9000 admin password; /usr/bin/mc mb myminio/logistics-bronze
+      || true; /usr/bin/mc policy set public myminio/logistics-bronze; exit 0; "
+
+      '
+    networks:
+    - logistics_net
+    restart: always
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: 09_airflow_standalone
+    mem_limit: 2560m
+    environment:
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - _AIRFLOW_DB_UPGRADE=True
+    - _AIRFLOW_WWW_USER_CREATE=True
+    - _AIRFLOW_WWW_USER_USERNAME=admin
+    - _AIRFLOW_WWW_USER_PASSWORD=admin
+    - AIRFLOW__WEBSERVER__X_FRAME_ENABLED=False
+    ports:
+    - 8080:8080
+    volumes:
+    - ./dags:/opt/airflow/dags
+    - ./:/opt/logistics
+    command: standalone
+    networks:
+    - logistics_net
+    restart: always
+  loki:
+    image: grafana/loki:latest
+    container_name: 10_loki
+    mem_limit: 256m
+    ports:
+    - 3100:3100
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+    - logistics_net
+    restart: always
+  grafana:
+    image: grafana/grafana:latest
+    container_name: 11_grafana
+    mem_limit: 256m
+    ports:
+    - 3000:3000
+    environment:
+    - GF_SECURITY_ADMIN_PASSWORD=admin
+    - GF_AUTH_ANONYMOUS_ENABLED=true
+    - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+    - ./grafana_provisioning:/etc/grafana/provisioning
+    networks:
+    - logistics_net
+    restart: always
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: 12_kafka_ui
+    mem_limit: 512m
+    ports:
+    - 8083:8080
+    environment:
+    - KAFKA_CLUSTERS_0_NAME=Logistics_Cluster
+    - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:29092
+    - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    - DYNAMIC_CONFIG_ENABLED=true
+    networks:
+    - logistics_net
+    restart: always
+  mlflow:
+    image: python:3.10-slim
+    container_name: 13_mlflow
+    mem_limit: 2560m
+    ports:
+    - 5000:5000
+    volumes:
+    - ./mlruns:/mlruns
+    command: /bin/sh -c "pip install mlflow && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlruns/mlflow.db --default-artifact-root /mlruns --allowed-hosts '*'"
+    networks:
+    - logistics_net
+    restart: always
+  spark-submit-job:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: 14_spark_submit
+    mem_limit: 1024m
+    depends_on:
+    - spark-master
+    - kafka
+    volumes:
+    - ./spark_processor.py:/opt/bitnami/spark/jobs/spark_processor.py
+    - ./spark_jars:/opt/bitnami/spark/jars_custom
+    - ./spark_models:/opt/logistics/spark_models
+    - ../DataCoSupplyChainDataset.csv:/tmp/DataCoSupplyChainDataset.csv:ro
+    - ./train_model.py:/opt/bitnami/spark/jobs/train_model.py
+    command: '/bin/sh -c " echo ''Waiting for Spark Master 30 seconds...''; sleep
+      30; echo ''Submitting Streaming Job...''; spark-submit --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.6.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      /opt/bitnami/spark/jobs/spark_processor.py "
+
+      '
+    networks:
+    - logistics_net
+    restart: 'always'
+
+  control-tower:
+    build: ./control_tower
+    container_name: 15_control_tower
+    mem_limit: 512m
+    environment:
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    - DATASET_FILE_PATH=/data/DataCoSupplyChainDataset.csv
+    - LOKI_URL=http://loki:3100/loki/api/v1/push
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./stream_manager.py:/app/stream_manager.py:ro
+    - ../DataCoSupplyChainDataset.csv:/data/DataCoSupplyChainDataset.csv:ro
+    networks:
+    - logistics_net
+    restart: always
+
+  gateway:
+    image: nginx:alpine
+    container_name: 00_gateway
+    mem_limit: 128m
+    ports:
+    - "8000:80"
+    - "18080:18080"
+    - "18083:18083"
+    - "18082:18082"
+    - "13000:13000"
+    - "15000:15000"
+    - "19001:19001"
+    - "18081:18081"
+    volumes:
+    - ./control_tower/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+    - control-tower
+    networks:
+    - logistics_net
+    restart: always
+
+networks:
+  logistics_net:
+    driver: bridge
+volumes:
+  pgdata_logistics: null
+  minio_data: null

@@ -1,0 +1,4 @@
+# Exclude generated dashboard and UI HTML files from GitHub Language Stats
+dbt_logistics/target/** linguist-vendored
+mlruns/** linguist-vendored
+*.html linguist-vendored
